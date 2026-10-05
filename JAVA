@@ -1,0 +1,427 @@
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.URLDecoder;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.sql.Connection;
+import java.sql.DriverManager;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
+import java.sql.SQLException;
+import java.sql.Statement;
+import java.util.LinkedHashMap;
+import java.util.Map;
+
+import com.sun.net.httpserver.HttpExchange;
+import com.sun.net.httpserver.HttpServer;
+
+/**
+ * FINSMART Core Java backend using the built-in Java HTTP server and SQLite JDBC.
+ * Run this class from the FinSmart project root, with the Web folder beside it.
+ * This server provides local APIs and serves files from the Web folder.
+ */
+public class FinSmartServer {
+    private static final int PORT = 8080;
+    private static final Path WEB_ROOT = Paths.get("Web").toAbsolutePath().normalize();
+    private static final Path DATA_DIR = Paths.get("data").toAbsolutePath().normalize();
+    private static final Path DB_FILE = DATA_DIR.resolve("finsmart.db");
+    private static final String DB_URL = "jdbc:sqlite:" + DB_FILE;
+
+    public static void main(String[] args) throws IOException, SQLException {
+        Files.createDirectories(DATA_DIR);
+        if (!Files.isDirectory(WEB_ROOT)) {
+            throw new IllegalStateException("Web folder not found. Run this program from the FinSmart project root.");
+        }
+
+        initializeDatabase();
+
+        HttpServer server = HttpServer.create(new InetSocketAddress("127.0.0.1", PORT), 0);
+        server.createContext("/api/health", FinSmartServer::handleHealth);
+        server.createContext("/api/incomes", FinSmartServer::handleIncomes);
+        server.createContext("/api/expenses", FinSmartServer::handleExpenses);
+        server.createContext("/api/goals", FinSmartServer::handleGoals);
+        server.createContext("/api/budget", FinSmartServer::handleBudget);
+        server.createContext("/api/summary", FinSmartServer::handleSummary);
+        server.createContext("/", FinSmartServer::handleStaticFiles);
+        server.setExecutor(null);
+        server.start();
+
+        System.out.println("FinSmart server is running at http://localhost:" + PORT);
+        System.out.println("SQLite database: " + DB_FILE);
+        System.out.println("Press Ctrl+C to stop the server.");
+    }
+
+    private static Connection connect() throws SQLException {
+        return DriverManager.getConnection(DB_URL);
+    }
+
+    private static void initializeDatabase() throws SQLException {
+        try (Connection conn = connect(); Statement st = conn.createStatement()) {
+            st.executeUpdate("""
+                CREATE TABLE IF NOT EXISTS incomes (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source TEXT NOT NULL,
+                    amount REAL NOT NULL CHECK(amount > 0),
+                    category TEXT NOT NULL,
+                    income_date TEXT NOT NULL,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+                """);
+            st.executeUpdate("""
+                CREATE TABLE IF NOT EXISTS expenses (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    expense_name TEXT NOT NULL,
+                    amount REAL NOT NULL CHECK(amount > 0),
+                    category TEXT NOT NULL,
+                    expense_date TEXT NOT NULL,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+                )
+                """);
+            st.executeUpdate("""
+                CREATE TABLE IF NOT EXISTS savings_goals (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    goal_name TEXT NOT NULL UNIQUE,
+                    target_amount REAL NOT NULL CHECK(target_amount > 0),
+                    saved_amount REAL NOT NULL DEFAULT 0 CHECK(saved_amount >= 0),
+                    CHECK(saved_amount <= target_amount)
+                )
+                """);
+            st.executeUpdate("""
+                CREATE TABLE IF NOT EXISTS budgets (
+                    id INTEGER PRIMARY KEY CHECK(id = 1),
+                    monthly_budget REAL NOT NULL CHECK(monthly_budget > 0)
+                )
+                """);
+        }
+    }
+
+    private static void handleHealth(HttpExchange ex) throws IOException {
+        if (!"GET".equals(ex.getRequestMethod())) {
+            sendJson(ex, 405, "{\"error\":\"Method not allowed\"}");
+            return;
+        }
+        sendJson(ex, 200, "{\"status\":\"ok\",\"application\":\"FinSmart\"}");
+    }
+
+    private static void handleIncomes(HttpExchange ex) throws IOException {
+        try {
+            if ("GET".equals(ex.getRequestMethod())) {
+                StringBuilder json = new StringBuilder("[");
+                try (Connection conn = connect();
+                     Statement st = conn.createStatement();
+                     ResultSet rs = st.executeQuery("SELECT id, source, amount, category, income_date FROM incomes ORDER BY id DESC")) {
+                    boolean first = true;
+                    while (rs.next()) {
+                        if (!first) json.append(',');
+                        first = false;
+                        json.append("{\"id\":").append(rs.getInt("id"))
+                            .append(",\"source\":").append(quote(rs.getString("source")))
+                            .append(",\"amount\":").append(rs.getDouble("amount"))
+                            .append(",\"category\":").append(quote(rs.getString("category")))
+                            .append(",\"date\":").append(quote(rs.getString("income_date"))).append('}');
+                    }
+                }
+                json.append(']');
+                sendJson(ex, 200, json.toString());
+            } else if ("POST".equals(ex.getRequestMethod())) {
+                Map<String, String> form = readForm(ex);
+                String source = required(form, "source");
+                String category = required(form, "category");
+                String date = required(form, "date");
+                double amount = positiveAmount(form, "amount");
+                try (Connection conn = connect(); PreparedStatement ps = conn.prepareStatement(
+                        "INSERT INTO incomes(source, amount, category, income_date) VALUES(?,?,?,?)")) {
+                    ps.setString(1, source);
+                    ps.setDouble(2, amount);
+                    ps.setString(3, category);
+                    ps.setString(4, date);
+                    ps.executeUpdate();
+                }
+                sendJson(ex, 201, "{\"message\":\"Income saved successfully\"}");
+            } else {
+                sendJson(ex, 405, "{\"error\":\"Method not allowed\"}");
+            }
+        } catch (IllegalArgumentException e) {
+            sendJson(ex, 400, jsonError(e.getMessage()));
+        } catch (SQLException e) {
+            sendJson(ex, 500, jsonError("Database error while handling incomes"));
+        }
+    }
+
+    private static void handleExpenses(HttpExchange ex) throws IOException {
+        try {
+            if ("GET".equals(ex.getRequestMethod())) {
+                StringBuilder json = new StringBuilder("[");
+                try (Connection conn = connect();
+                     Statement st = conn.createStatement();
+                     ResultSet rs = st.executeQuery("SELECT id, expense_name, amount, category, expense_date FROM expenses ORDER BY id DESC")) {
+                    boolean first = true;
+                    while (rs.next()) {
+                        if (!first) json.append(',');
+                        first = false;
+                        json.append("{\"id\":").append(rs.getInt("id"))
+                            .append(",\"expenseName\":").append(quote(rs.getString("expense_name")))
+                            .append(",\"amount\":").append(rs.getDouble("amount"))
+                            .append(",\"category\":").append(quote(rs.getString("category")))
+                            .append(",\"date\":").append(quote(rs.getString("expense_date"))).append('}');
+                    }
+                }
+                json.append(']');
+                sendJson(ex, 200, json.toString());
+            } else if ("POST".equals(ex.getRequestMethod())) {
+                Map<String, String> form = readForm(ex);
+                String name = required(form, "expenseName");
+                String category = required(form, "category");
+                String date = required(form, "date");
+                double amount = positiveAmount(form, "amount");
+                try (Connection conn = connect(); PreparedStatement ps = conn.prepareStatement(
+                        "INSERT INTO expenses(expense_name, amount, category, expense_date) VALUES(?,?,?,?)")) {
+                    ps.setString(1, name);
+                    ps.setDouble(2, amount);
+                    ps.setString(3, category);
+                    ps.setString(4, date);
+                    ps.executeUpdate();
+                }
+                sendJson(ex, 201, "{\"message\":\"Expense saved successfully\"}");
+            } else {
+                sendJson(ex, 405, "{\"error\":\"Method not allowed\"}");
+            }
+        } catch (IllegalArgumentException e) {
+            sendJson(ex, 400, jsonError(e.getMessage()));
+        } catch (SQLException e) {
+            sendJson(ex, 500, jsonError("Database error while handling expenses"));
+        }
+    }
+
+    private static void handleGoals(HttpExchange ex) throws IOException {
+        try {
+            if ("GET".equals(ex.getRequestMethod())) {
+                StringBuilder json = new StringBuilder("[");
+                try (Connection conn = connect();
+                     Statement st = conn.createStatement();
+                     ResultSet rs = st.executeQuery("SELECT goal_name, target_amount, saved_amount FROM savings_goals ORDER BY goal_name")) {
+                    boolean first = true;
+                    while (rs.next()) {
+                        if (!first) json.append(',');
+                        first = false;
+                        double target = rs.getDouble("target_amount");
+                        double saved = rs.getDouble("saved_amount");
+                        int percentage = target > 0 ? (int) Math.round(saved / target * 100) : 0;
+                        json.append("{\"name\":").append(quote(rs.getString("goal_name")))
+                            .append(",\"target\":").append(target)
+                            .append(",\"saved\":").append(saved)
+                            .append(",\"percentage\":").append(percentage).append('}');
+                    }
+                }
+                json.append(']');
+                sendJson(ex, 200, json.toString());
+            } else if ("POST".equals(ex.getRequestMethod())) {
+                Map<String, String> form = readForm(ex);
+                String name = required(form, "name");
+                double target = positiveAmount(form, "target");
+                double saved = nonNegativeAmount(form, "saved");
+                if (saved > target) throw new IllegalArgumentException("Saved amount cannot exceed the target amount");
+                try (Connection conn = connect(); PreparedStatement ps = conn.prepareStatement("""
+                        INSERT INTO savings_goals(goal_name, target_amount, saved_amount) VALUES(?,?,?)
+                        ON CONFLICT(goal_name) DO UPDATE SET target_amount=excluded.target_amount, saved_amount=excluded.saved_amount
+                        """)) {
+                    ps.setString(1, name);
+                    ps.setDouble(2, target);
+                    ps.setDouble(3, saved);
+                    ps.executeUpdate();
+                }
+                sendJson(ex, 201, "{\"message\":\"Savings goal saved successfully\"}");
+            } else {
+                sendJson(ex, 405, "{\"error\":\"Method not allowed\"}");
+            }
+        } catch (IllegalArgumentException e) {
+            sendJson(ex, 400, jsonError(e.getMessage()));
+        } catch (SQLException e) {
+            sendJson(ex, 500, jsonError("Database error while handling savings goals"));
+        }
+    }
+
+    private static void handleBudget(HttpExchange ex) throws IOException {
+        try {
+            if ("GET".equals(ex.getRequestMethod())) {
+                try (Connection conn = connect(); Statement st = conn.createStatement();
+                     ResultSet rs = st.executeQuery("SELECT monthly_budget FROM budgets WHERE id=1")) {
+                    if (rs.next()) {
+                        sendJson(ex, 200, "{\"monthlyBudget\":" + rs.getDouble("monthly_budget") + "}");
+                    } else {
+                        sendJson(ex, 200, "{\"monthlyBudget\":0}");
+                    }
+                }
+            } else if ("POST".equals(ex.getRequestMethod())) {
+                Map<String, String> form = readForm(ex);
+                double amount = positiveAmount(form, "amount");
+                try (Connection conn = connect(); PreparedStatement ps = conn.prepareStatement("""
+                        INSERT INTO budgets(id, monthly_budget) VALUES(1, ?)
+                        ON CONFLICT(id) DO UPDATE SET monthly_budget=excluded.monthly_budget
+                        """)) {
+                    ps.setDouble(1, amount);
+                    ps.executeUpdate();
+                }
+                sendJson(ex, 201, "{\"message\":\"Budget saved successfully\"}");
+            } else {
+                sendJson(ex, 405, "{\"error\":\"Method not allowed\"}");
+            }
+        } catch (IllegalArgumentException e) {
+            sendJson(ex, 400, jsonError(e.getMessage()));
+        } catch (SQLException e) {
+            sendJson(ex, 500, jsonError("Database error while handling budget"));
+        }
+    }
+
+    private static void handleSummary(HttpExchange ex) throws IOException {
+        if (!"GET".equals(ex.getRequestMethod())) {
+            sendJson(ex, 405, "{\"error\":\"Method not allowed\"}");
+            return;
+        }
+        try (Connection conn = connect(); Statement st = conn.createStatement()) {
+            double income = sum(st, "SELECT COALESCE(SUM(amount),0) FROM incomes");
+            double expense = sum(st, "SELECT COALESCE(SUM(amount),0) FROM expenses");
+            String topCategory = "None";
+            try (ResultSet rs = st.executeQuery("SELECT category, SUM(amount) AS total FROM expenses GROUP BY category ORDER BY total DESC LIMIT 1")) {
+                if (rs.next()) topCategory = rs.getString("category");
+            }
+            double budget = 0;
+            try (ResultSet rs = st.executeQuery("SELECT monthly_budget FROM budgets WHERE id=1")) {
+                if (rs.next()) budget = rs.getDouble("monthly_budget");
+            }
+            String json = "{\"totalIncome\":" + income
+                    + ",\"totalExpense\":" + expense
+                    + ",\"balance\":" + (income - expense)
+                    + ",\"topCategory\":" + quote(topCategory)
+                    + ",\"monthlyBudget\":" + budget + "}";
+            sendJson(ex, 200, json);
+        } catch (SQLException e) {
+            sendJson(ex, 500, jsonError("Database error while building summary"));
+        }
+    }
+
+    private static double sum(Statement st, String sql) throws SQLException {
+        try (ResultSet rs = st.executeQuery(sql)) {
+            return rs.next() ? rs.getDouble(1) : 0;
+        }
+    }
+
+    private static void handleStaticFiles(HttpExchange ex) throws IOException {
+        if (!"GET".equals(ex.getRequestMethod()) && !"HEAD".equals(ex.getRequestMethod())) {
+            sendJson(ex, 405, "{\"error\":\"Method not allowed\"}");
+            return;
+        }
+        String requestPath = ex.getRequestURI().getPath();
+        if (requestPath == null || requestPath.equals("/")) requestPath = "/index.html";
+        Path file = WEB_ROOT.resolve(requestPath.substring(1)).normalize();
+        if (!file.startsWith(WEB_ROOT) || !Files.isRegularFile(file)) {
+            sendText(ex, 404, "Not found", "text/plain; charset=UTF-8");
+            return;
+        }
+        String mime = contentType(file);
+        byte[] bytes = Files.readAllBytes(file);
+        ex.getResponseHeaders().set("Content-Type", mime);
+        ex.getResponseHeaders().set("X-Content-Type-Options", "nosniff");
+        if ("HEAD".equals(ex.getRequestMethod())) {
+            ex.sendResponseHeaders(200, -1);
+            ex.close();
+        } else {
+            ex.sendResponseHeaders(200, bytes.length);
+            ex.getResponseBody().write(bytes);
+            ex.close();
+        }
+    }
+
+    private static String contentType(Path file) {
+        String name = file.getFileName().toString().toLowerCase();
+        if (name.endsWith(".html")) return "text/html; charset=UTF-8";
+        if (name.endsWith(".css")) return "text/css; charset=UTF-8";
+        if (name.endsWith(".js")) return "application/javascript; charset=UTF-8";
+        if (name.endsWith(".json")) return "application/json; charset=UTF-8";
+        if (name.endsWith(".png")) return "image/png";
+        if (name.endsWith(".jpg") || name.endsWith(".jpeg")) return "image/jpeg";
+        if (name.endsWith(".svg")) return "image/svg+xml";
+        return "application/octet-stream";
+    }
+
+    private static Map<String, String> readForm(HttpExchange ex) throws IOException {
+        String body = new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8);
+        Map<String, String> values = new LinkedHashMap<>();
+        if (body.isBlank()) return values;
+        for (String pair : body.split("&")) {
+            String[] pieces = pair.split("=", 2);
+            String key = URLDecoder.decode(pieces[0], StandardCharsets.UTF_8);
+            String value = pieces.length > 1 ? URLDecoder.decode(pieces[1], StandardCharsets.UTF_8) : "";
+            values.put(key, value);
+        }
+        return values;
+    }
+
+    private static String required(Map<String, String> form, String key) {
+        String value = form.get(key);
+        if (value == null || value.isBlank()) {
+            throw new IllegalArgumentException("Missing required field: " + key);
+        }
+        return value.trim();
+    }
+
+    private static double positiveAmount(Map<String, String> form, String key) {
+        String value = required(form, key);
+        try {
+            double amount = Double.parseDouble(value);
+            if (!Double.isFinite(amount) || amount <= 0) throw new NumberFormatException();
+            return amount;
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("Amount must be a number greater than zero");
+        }
+    }
+
+    private static double nonNegativeAmount(Map<String, String> form, String key) {
+        String value = required(form, key);
+        try {
+            double amount = Double.parseDouble(value);
+            if (!Double.isFinite(amount) || amount < 0) throw new NumberFormatException();
+            return amount;
+        } catch (NumberFormatException e) {
+            throw new IllegalArgumentException("Saved amount must be zero or greater");
+        }
+    }
+
+    private static String quote(String text) {
+        if (text == null) return "null";
+        StringBuilder out = new StringBuilder("\"");
+        for (char c : text.toCharArray()) {
+            switch (c) {
+                case '"' -> out.append("\\\"");
+                case '\\' -> out.append("\\\\");
+                case '\n' -> out.append("\\n");
+                case '\r' -> out.append("\\r");
+                case '\t' -> out.append("\\t");
+                default -> {
+                    if (c < 0x20) out.append(String.format("\\u%04x", (int) c));
+                    else out.append(c);
+                }
+            }
+        }
+        return out.append('"').toString();
+    }
+
+    private static String jsonError(String message) {
+        return "{\"error\":" + quote(message) + "}";
+    }
+
+    private static void sendJson(HttpExchange ex, int status, String json) throws IOException {
+        sendText(ex, status, json, "application/json; charset=UTF-8");
+    }
+
+    private static void sendText(HttpExchange ex, int status, String text, String contentType) throws IOException {
+        byte[] bytes = text.getBytes(StandardCharsets.UTF_8);
+        ex.getResponseHeaders().set("Content-Type", contentType);
+        ex.getResponseHeaders().set("Cache-Control", "no-store");
+        ex.sendResponseHeaders(status, bytes.length);
+        ex.getResponseBody().write(bytes);
+        ex.close();
+    }
+}
